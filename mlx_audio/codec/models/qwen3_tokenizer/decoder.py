@@ -1,7 +1,16 @@
 # Copyright (c) 2025 MLX Audio Contributors
 # Licensed under the MIT License
 
-"""Decoder for Qwen3 TTS Tokenizer."""
+"""Native MLX Decoder for Qwen3 TTS Tokenizer.
+
+Architecture matches the HuggingFace weights exactly:
+- Quantizer: RVQ dequantization (16 codebooks)
+- Pre-conv: Conv1d (512 -> 1024)
+- Pre-transformer: 8 transformer layers
+- Upsample: 2x2 = 4x (ConvNeXt-style blocks)
+- SEANet decoder: 4 upsample blocks (8x5x4x3 = 480x)
+Total: 4 * 480 = 1920x upsampling (12.5 Hz -> 24000 Hz)
+"""
 
 from typing import List, Optional, Tuple
 
@@ -18,6 +27,237 @@ from .layers import (
     RMSNorm,
     Snake,
 )
+
+
+# =============================================================================
+# Quantizer Components
+# =============================================================================
+
+
+class Codebook(nn.Module):
+    """Vector quantization codebook with normalized embeddings."""
+
+    def __init__(self, codebook_size: int = 2048, codebook_dim: int = 256):
+        super().__init__()
+        # Weights stored as embedding_sum / cluster_usage
+        self._codebook = CodebookEmbedding(codebook_size, codebook_dim)
+
+    def decode(self, indices: mx.array) -> mx.array:
+        """Decode indices to embeddings."""
+        return self._codebook.decode(indices)
+
+
+class CodebookEmbedding(nn.Module):
+    """Codebook embedding storage."""
+
+    def __init__(self, codebook_size: int, codebook_dim: int):
+        super().__init__()
+        self.embedding_sum = mx.zeros((codebook_size, codebook_dim))
+        self.cluster_usage = mx.ones((codebook_size,))
+
+    @property
+    def embeddings(self) -> mx.array:
+        """Get normalized embeddings."""
+        return self.embedding_sum / (self.cluster_usage[:, None] + 1e-9)
+
+    def decode(self, indices: mx.array) -> mx.array:
+        """Decode indices to embeddings."""
+        return mx.take(self.embeddings, indices, axis=0)
+
+
+class VQLayer(nn.Module):
+    """Single VQ layer."""
+
+    def __init__(self, codebook_size: int = 2048, codebook_dim: int = 256):
+        super().__init__()
+        self.layers = [Codebook(codebook_size, codebook_dim)]
+
+    def decode(self, indices: mx.array) -> mx.array:
+        """Decode a single codebook."""
+        return self.layers[0].decode(indices)
+
+
+class RVQDecode(nn.Module):
+    """RVQ decode module with input/output projections."""
+
+    def __init__(
+        self,
+        hidden_size: int = 512,
+        codebook_dim: int = 256,
+        codebook_size: int = 2048,
+        num_codebooks: int = 1,
+    ):
+        super().__init__()
+        # 1x1 Conv projections stored as (out, in, 1)
+        self.input_proj = Conv1dPointwise(hidden_size, codebook_dim)
+        self.output_proj = Conv1dPointwise(codebook_dim, hidden_size)
+
+        # VQ layers
+        self.vq = VQMulti(num_codebooks, codebook_size, codebook_dim)
+
+    def __call__(self, codes: mx.array) -> mx.array:
+        """Decode codes to latents.
+
+        Args:
+            codes: (batch, num_codebooks, frames)
+
+        Returns:
+            (batch, frames, hidden_size)
+        """
+        # Dequantize and sum
+        embeddings = self.vq.decode(codes)  # (batch, frames, codebook_dim)
+        # Project to hidden_size
+        return self.output_proj(embeddings)
+
+
+class VQMulti(nn.Module):
+    """Multiple VQ layers for RVQ."""
+
+    def __init__(
+        self, num_codebooks: int, codebook_size: int = 2048, codebook_dim: int = 256
+    ):
+        super().__init__()
+        self.layers = [
+            Codebook(codebook_size, codebook_dim) for _ in range(num_codebooks)
+        ]
+
+    def decode(self, codes: mx.array) -> mx.array:
+        """Decode multiple codebooks and sum.
+
+        Args:
+            codes: (batch, num_codebooks, frames)
+
+        Returns:
+            (batch, frames, codebook_dim)
+        """
+        total = None
+        for i, codebook in enumerate(self.layers):
+            emb = codebook.decode(codes[:, i, :])  # (batch, frames, codebook_dim)
+            if total is None:
+                total = emb
+            else:
+                total = total + emb
+        return total
+
+
+class Conv1dPointwise(nn.Module):
+    """1x1 convolution (pointwise) matching weight format (out, in, 1)."""
+
+    def __init__(self, in_channels: int, out_channels: int):
+        super().__init__()
+        self.weight = mx.zeros((out_channels, in_channels, 1))
+
+    def __call__(self, x: mx.array) -> mx.array:
+        # x: (batch, frames, in_channels)
+        weight = self.weight[:, :, 0]  # (out, in)
+        return x @ weight.T
+
+
+class Quantizer(nn.Module):
+    """Full quantizer with rvq_first and rvq_rest."""
+
+    def __init__(self, config: DecoderConfig):
+        super().__init__()
+        # First codebook (semantic)
+        self.rvq_first = RVQDecode(
+            hidden_size=config.hidden_size,
+            codebook_dim=config.codebook_dim,
+            codebook_size=config.codebook_size,
+            num_codebooks=1,
+        )
+        # Remaining codebooks (acoustic) - 15 codebooks
+        self.rvq_rest = RVQDecode(
+            hidden_size=config.hidden_size,
+            codebook_dim=config.codebook_dim,
+            codebook_size=config.codebook_size,
+            num_codebooks=config.num_quantizers - 1,
+        )
+
+    def __call__(self, codes: mx.array) -> mx.array:
+        """Dequantize all codebooks.
+
+        Args:
+            codes: (batch, 16, frames)
+
+        Returns:
+            (batch, frames, hidden_size)
+        """
+        first_out = self.rvq_first(codes[:, 0:1, :])
+        rest_out = self.rvq_rest(codes[:, 1:, :])
+        return first_out + rest_out
+
+
+# =============================================================================
+# Upsample Modules (ConvNeXt-style)
+# =============================================================================
+
+
+class ConvNeXtBlock(nn.Module):
+    """ConvNeXt-style block with depthwise conv."""
+
+    def __init__(self, channels: int):
+        super().__init__()
+        # Depthwise conv
+        self.dwconv = DWConv(channels)
+        self.gamma = mx.ones((channels,))
+        self.norm = nn.LayerNorm(channels)
+        self.pwconv1 = nn.Linear(channels, channels * 4, bias=True)
+        self.pwconv2 = nn.Linear(channels * 4, channels, bias=True)
+
+    def __call__(self, x: mx.array) -> mx.array:
+        residual = x
+        x = self.dwconv(x)
+        x = x * self.gamma
+        x = self.norm(x)
+        x = self.pwconv1(x)
+        x = nn.gelu(x)
+        x = self.pwconv2(x)
+        return residual + x
+
+
+class DWConv(nn.Module):
+    """Depthwise 1D conv."""
+
+    def __init__(self, channels: int, kernel_size: int = 7):
+        super().__init__()
+        self.conv = Conv1d(
+            channels, channels, kernel_size, padding=kernel_size // 2, groups=channels
+        )
+
+    def __call__(self, x: mx.array) -> mx.array:
+        return self.conv(x)
+
+
+class UpsampleModule(nn.Module):
+    """Single upsample stage: ConvTranspose + ConvNeXt block."""
+
+    def __init__(self, channels: int, ratio: int = 2):
+        super().__init__()
+        # Index 0: ConvTranspose for upsampling
+        self.upsample_conv = ConvTranspose1d(
+            channels, channels, kernel_size=ratio, stride=ratio
+        )
+        # Index 1: ConvNeXt block
+        self.convnext = ConvNeXtBlock(channels)
+
+    def __call__(self, x: mx.array) -> mx.array:
+        x = self.upsample_conv(x)
+        x = self.convnext(x)
+        return x
+
+
+class Upsample(nn.Module):
+    """Upsample module with multiple stages."""
+
+    def __init__(self, channels: int, ratios: List[int]):
+        super().__init__()
+        # List of (ConvTranspose, ConvNeXt) tuples stored as list indices
+        self.stages = [UpsampleModule(channels, r) for r in ratios]
+
+    def __call__(self, x: mx.array) -> mx.array:
+        for stage in self.stages:
+            x = stage(x)
+        return x
 
 
 class DecoderTransformerBlock(nn.Module):
@@ -251,34 +491,371 @@ class ConvDecoder(nn.Module):
         return x
 
 
-class Decoder(nn.Module):
-    """Full decoder: Pre-Transformer -> Conv Decoder."""
+# =============================================================================
+# SEANet Decoder (matches HuggingFace weights exactly)
+# =============================================================================
+
+
+class SEANetResidualBlock(nn.Module):
+    """SEANet residual block with Snake activation.
+
+    Matches weights: decoder.decoder.{1-4}.block.{2,3,4}.*
+    """
+
+    def __init__(self, channels: int, kernel_size: int = 7):
+        super().__init__()
+        self.act1 = Snake(channels)
+        self.act2 = Snake(channels)
+        # Note: conv1 and conv2 have nested .conv
+        self.conv1 = WNConv1d(channels, channels, kernel_size, padding=kernel_size // 2)
+        self.conv2 = WNConv1d(channels, channels, 1)
+
+    def __call__(self, x: mx.array) -> mx.array:
+        residual = x
+        x = self.act1(x)
+        x = self.conv1(x)
+        x = self.act2(x)
+        x = self.conv2(x)
+        return x + residual
+
+
+class WNConv1d(nn.Module):
+    """Weight-normalized Conv1d (stored with nested .conv)."""
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int,
+        stride: int = 1,
+        padding: int = 0,
+    ):
+        super().__init__()
+        self.conv = Conv1d(in_channels, out_channels, kernel_size, stride=stride, padding=padding)
+
+    def __call__(self, x: mx.array) -> mx.array:
+        return self.conv(x)
+
+
+class SEANetBlock(nn.Module):
+    """SEANet upsample block.
+
+    Matches weights: decoder.decoder.{1-4}.block.*
+    Structure:
+    - block.0: LayerNorm (alpha, beta)
+    - block.1: ConvTranspose (in_ch, out_ch, k=stride*2)
+    - block.2-4: 3x ResidualBlocks
+    """
+
+    def __init__(self, in_channels: int, out_channels: int, stride: int):
+        super().__init__()
+        # Index 0: Layer norm (stored as alpha/beta not weight/bias)
+        self.block = SEANetBlockInner(in_channels, out_channels, stride)
+
+    def __call__(self, x: mx.array) -> mx.array:
+        return self.block(x)
+
+
+class SEANetBlockInner(nn.Module):
+    """Inner block structure matching weight indices."""
+
+    def __init__(self, in_channels: int, out_channels: int, stride: int):
+        super().__init__()
+        # Match weight indices exactly
+        self.norm = LayerNormAB(in_channels)  # block.0.alpha/beta
+        self.upsample = WNConv1dTranspose(
+            in_channels, out_channels, kernel_size=stride * 2, stride=stride
+        )  # block.1.conv
+        self.residuals = [
+            SEANetResidualBlock(out_channels, kernel_size=7) for _ in range(3)
+        ]  # block.2, 3, 4
+
+    def __call__(self, x: mx.array) -> mx.array:
+        x = self.norm(x)
+        x = self.upsample(x)
+        for res in self.residuals:
+            x = res(x)
+        return x
+
+
+class LayerNormAB(nn.Module):
+    """Layer norm with alpha/beta instead of weight/bias."""
+
+    def __init__(self, channels: int, eps: float = 1e-5):
+        super().__init__()
+        self.alpha = mx.ones((channels,))
+        self.beta = mx.zeros((channels,))
+        self.eps = eps
+
+    def __call__(self, x: mx.array) -> mx.array:
+        # x: (batch, time, channels)
+        mean = mx.mean(x, axis=-1, keepdims=True)
+        var = mx.var(x, axis=-1, keepdims=True)
+        x = (x - mean) / mx.sqrt(var + self.eps)
+        return x * self.alpha + self.beta
+
+
+class WNConv1dTranspose(nn.Module):
+    """Transposed Conv1d with nested .conv."""
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int,
+        stride: int = 1,
+    ):
+        super().__init__()
+        self.conv = ConvTranspose1d(in_channels, out_channels, kernel_size, stride=stride)
+
+    def __call__(self, x: mx.array) -> mx.array:
+        return self.conv(x)
+
+
+class SEANetDecoder(nn.Module):
+    """SEANet decoder matching HuggingFace weight structure.
+
+    Structure (decoder.decoder.X):
+    - 0: Initial Conv1d (latent_dim -> decoder_dim, k=7)
+    - 1-4: 4 upsample blocks with rates [8, 5, 4, 3]
+    - 5: Final LayerNorm (alpha, beta)
+    - 6: Final Conv1d (96 -> 1, k=7)
+
+    Total upsampling: 8*5*4*3 = 480x
+    """
 
     def __init__(self, config: DecoderConfig):
         super().__init__()
         self.config = config
 
-        self.pre_transformer = DecoderTransformer(config)
-        self.decoder = ConvDecoder(config)
+        # Build decoder as list to match weight indices
+        self.decoder = []
 
-    def __call__(
-        self,
-        hidden_states: mx.array,
-        cache: Optional[List[Tuple[mx.array, mx.array]]] = None,
-    ) -> Tuple[mx.array, List[Tuple[mx.array, mx.array]]]:
-        # hidden_states: (batch, time, latent_dim)
-        hidden_states, new_cache = self.pre_transformer(hidden_states, cache=cache)
+        # Index 0: Initial conv (latent_dim -> decoder_dim)
+        self.decoder.append(InitConv(config.latent_dim, config.decoder_dim))
 
-        # Transform to (batch, hidden_size, time) for conv decoder
-        # But conv decoder expects latent_dim, so we need output projection
-        # Actually the pre_transformer outputs hidden_size, we need to project back
-        # For simplicity, we'll adjust the conv decoder input
+        # Index 1-4: Upsample blocks
+        channels = config.decoder_dim  # 1536
+        for i, rate in enumerate(config.upsample_rates):  # [8, 5, 4, 3]
+            out_channels = channels // 2
+            self.decoder.append(SEANetBlock(channels, out_channels, rate))
+            channels = out_channels
 
-        # hidden_states: (batch, time, hidden_size) -> (batch, latent_dim, time)
-        # We need a projection here - let's add it
-        hidden_states = hidden_states.swapaxes(-1, -2)
+        # Index 5: Final layer norm
+        self.decoder.append(LayerNormAB(channels))
 
-        # Decode to audio
-        audio = self.decoder(hidden_states)
+        # Index 6: Final conv to audio
+        self.decoder.append(FinalConv(channels, 1))
 
-        return audio, new_cache
+    def __call__(self, x: mx.array) -> mx.array:
+        """Decode latents to audio.
+
+        Args:
+            x: (batch, frames, latent_dim)
+
+        Returns:
+            (batch, time, 1)
+        """
+        for module in self.decoder:
+            x = module(x)
+        return x
+
+
+class InitConv(nn.Module):
+    """Initial conv layer (decoder.decoder.0)."""
+
+    def __init__(self, in_channels: int, out_channels: int):
+        super().__init__()
+        self.conv = Conv1d(in_channels, out_channels, kernel_size=7, padding=3)
+
+    def __call__(self, x: mx.array) -> mx.array:
+        return self.conv(x)
+
+
+class FinalConv(nn.Module):
+    """Final conv layer (decoder.decoder.6)."""
+
+    def __init__(self, in_channels: int, out_channels: int):
+        super().__init__()
+        self.conv = Conv1d(in_channels, out_channels, kernel_size=7, padding=3)
+
+    def __call__(self, x: mx.array) -> mx.array:
+        return self.conv(x)
+
+
+# =============================================================================
+# Pre-Transformer (matches decoder.pre_transformer.*)
+# =============================================================================
+
+
+class PreTransformer(nn.Module):
+    """Pre-transformer matching decoder.pre_transformer.* weights."""
+
+    def __init__(self, config: DecoderConfig):
+        super().__init__()
+        # input_proj: (1024 -> 512)
+        self.input_proj = nn.Linear(config.latent_dim, config.hidden_size, bias=True)
+
+        # 8 transformer layers
+        self.layers = [
+            DecoderTransformerBlock(
+                hidden_size=config.hidden_size,
+                num_attention_heads=config.num_attention_heads,
+                num_key_value_heads=config.num_key_value_heads,
+                intermediate_size=config.intermediate_size,
+                head_dim=config.head_dim,
+                rope_theta=config.rope_theta,
+                max_position_embeddings=config.max_position_embeddings,
+                sliding_window=config.sliding_window,
+                layer_scale=config.layer_scale_initial_scale,
+                rms_norm_eps=config.rms_norm_eps,
+            )
+            for _ in range(config.num_hidden_layers)
+        ]
+
+        # Final norm
+        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+        # output_proj: (512 -> 1024)
+        self.output_proj = nn.Linear(config.hidden_size, config.latent_dim, bias=True)
+
+    def __call__(self, x: mx.array) -> mx.array:
+        """Process through transformer.
+
+        Args:
+            x: (batch, frames, latent_dim)
+
+        Returns:
+            (batch, frames, latent_dim)
+        """
+        x = self.input_proj(x)
+
+        for layer in self.layers:
+            x, _ = layer(x)
+
+        x = self.norm(x)
+        x = self.output_proj(x)
+        return x
+
+
+# =============================================================================
+# Full Decoder (matches decoder.* weight structure)
+# =============================================================================
+
+
+class Decoder(nn.Module):
+    """Full decoder matching HuggingFace weight structure.
+
+    Structure:
+    - quantizer: RVQ dequantization (rvq_first + rvq_rest)
+    - pre_conv: Conv1d (hidden_size -> latent_dim)
+    - pre_transformer: 8 transformer layers
+    - upsample: 2x2 = 4x ConvNeXt-style upsampling
+    - decoder: SEANet decoder (480x upsampling)
+
+    Total: 4 * 480 = 1920x (12.5 Hz -> 24000 Hz)
+    """
+
+    def __init__(self, config: DecoderConfig):
+        super().__init__()
+        self.config = config
+
+        # Quantizer dequantization
+        self.quantizer = Quantizer(config)
+
+        # Pre-conv: (hidden_size -> latent_dim)
+        self.pre_conv = WNConv1d(
+            config.hidden_size, config.latent_dim, kernel_size=3, padding=1
+        )
+
+        # Pre-transformer
+        self.pre_transformer = PreTransformer(config)
+
+        # Upsample (4x total from [2, 2])
+        self.upsample = [
+            UpsampleStage(config.latent_dim, ratio)
+            for ratio in config.upsampling_ratios
+        ]
+
+        # SEANet decoder (480x upsampling)
+        self.decoder = SEANetDecoder(config)
+
+    def __call__(self, codes: mx.array) -> mx.array:
+        """Decode codes to audio waveform.
+
+        Args:
+            codes: (batch, num_codebooks, frames)
+
+        Returns:
+            (batch, time) audio waveform
+        """
+        # Dequantize codes to latent
+        x = self.quantizer(codes)  # (batch, frames, hidden_size)
+
+        # Pre-conv
+        x = self.pre_conv(x)  # (batch, frames, latent_dim)
+
+        # Pre-transformer
+        x = self.pre_transformer(x)  # (batch, frames, latent_dim)
+
+        # Upsample 4x
+        for up in self.upsample:
+            x = up(x)
+
+        # SEANet decode to audio (480x)
+        x = self.decoder(x)  # (batch, time, 1)
+
+        return x.squeeze(-1)  # (batch, time)
+
+
+class UpsampleStage(nn.Module):
+    """Single upsample stage matching decoder.upsample.X.* weights.
+
+    Structure:
+    - 0: ConvTranspose (conv)
+    - 1: ConvNeXt block (dwconv, gamma, norm, pwconv1, pwconv2)
+    """
+
+    def __init__(self, channels: int, ratio: int = 2):
+        super().__init__()
+        # Module list with indices 0, 1
+        self.conv_transpose = UpsampleConvTranspose(channels, ratio)
+        self.convnext = UpsampleConvNeXt(channels)
+
+    def __call__(self, x: mx.array) -> mx.array:
+        x = self.conv_transpose(x)
+        x = self.convnext(x)
+        return x
+
+
+class UpsampleConvTranspose(nn.Module):
+    """Upsample ConvTranspose matching decoder.upsample.X.0.conv."""
+
+    def __init__(self, channels: int, ratio: int):
+        super().__init__()
+        self.conv = ConvTranspose1d(channels, channels, kernel_size=ratio, stride=ratio)
+
+    def __call__(self, x: mx.array) -> mx.array:
+        return self.conv(x)
+
+
+class UpsampleConvNeXt(nn.Module):
+    """ConvNeXt block matching decoder.upsample.X.1.*."""
+
+    def __init__(self, channels: int):
+        super().__init__()
+        self.dwconv = DWConv(channels)
+        self.gamma = mx.ones((channels,))
+        self.norm = nn.LayerNorm(channels)
+        self.pwconv1 = nn.Linear(channels, channels * 4, bias=True)
+        self.pwconv2 = nn.Linear(channels * 4, channels, bias=True)
+
+    def __call__(self, x: mx.array) -> mx.array:
+        residual = x
+        x = self.dwconv(x)
+        x = x * self.gamma
+        x = self.norm(x)
+        x = self.pwconv1(x)
+        x = nn.gelu(x)
+        x = self.pwconv2(x)
+        return residual + x

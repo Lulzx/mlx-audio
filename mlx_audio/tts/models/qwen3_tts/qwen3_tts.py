@@ -3,30 +3,25 @@
 
 """Qwen3-TTS Model implementation for MLX.
 
-This implementation uses the official qwen-tts package for inference,
-as the model architecture is complex with a talker module, code predictor,
-and multi-head outputs.
-
-Requires: pip install qwen-tts torch
-A native MLX implementation is planned for a future release.
+Supports both native MLX inference (fast) and PyTorch backend (fallback).
 """
 
 import time
 from pathlib import Path
-from typing import Generator, Optional, Union
+from typing import Generator, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
 
 from ..base import GenerationResult
 from .config import ModelConfig
+from .model import Qwen3TTSNative, TalkerConfig
 
 
 class Model(nn.Module):
     """Qwen3-TTS Model for text-to-speech synthesis.
 
-    This model uses the official qwen-tts package for inference,
-    providing voice cloning, preset speakers, and voice design capabilities.
+    Native MLX implementation for fast inference on Apple Silicon.
 
     Supports three model variants:
     - Base: Voice cloning with reference audio
@@ -38,9 +33,30 @@ class Model(nn.Module):
         super().__init__()
         self.config = config
         self.model_type = config.model_type
+
+        # Build native model config
+        talker_config = TalkerConfig(
+            hidden_size=config.hidden_size,
+            text_hidden_size=config.text_hidden_size,
+            num_hidden_layers=config.num_hidden_layers,
+            num_attention_heads=config.num_attention_heads,
+            num_key_value_heads=config.num_key_value_heads,
+            intermediate_size=config.intermediate_size,
+            head_dim=config.head_dim,
+            rms_norm_eps=config.rms_norm_eps,
+            rope_theta=config.rope_theta,
+            max_position_embeddings=config.max_position_embeddings,
+            vocab_size=config.vocab_size,
+            text_vocab_size=config.text_vocab_size,
+            num_codebooks=config.num_code_groups,
+        )
+
+        # Native MLX model
+        self.talker = Qwen3TTSNative(talker_config).talker
+
+        # Tokenizer (loaded in post_load_hook)
         self.tokenizer = None
-        self._qwen_model = None
-        self._model_path = None
+        self._audio_tokenizer = None
 
     @property
     def sample_rate(self) -> int:
@@ -52,71 +68,110 @@ class Model(nn.Module):
 
     @classmethod
     def post_load_hook(cls, model: "Model", model_path: Path) -> "Model":
-        """Hook called after model weights are loaded.
+        """Load tokenizer after weights are loaded."""
+        from transformers import AutoTokenizer
 
-        Stores the model path for lazy loading of the qwen-tts model.
-        """
-        model._model_path = str(model_path)
+        model.tokenizer = AutoTokenizer.from_pretrained(
+            str(model_path), trust_remote_code=True
+        )
         return model
 
     def sanitize(self, weights: dict) -> dict:
-        """Sanitize weights - skip all weights since we use qwen-tts backend.
+        """Remap weight names from HuggingFace format to MLX format."""
+        new_weights = {}
 
-        This model uses the official qwen-tts package for inference,
-        so we don't need to load any MLX weights.
-        """
-        return {}
+        for k, v in weights.items():
+            # All weights start with "talker."
+            if not k.startswith("talker."):
+                continue
 
-    def _load_qwen_model(self):
-        """Load the qwen-tts model."""
-        if self._qwen_model is not None:
-            return
+            new_key = k
 
-        try:
-            import torch
-            from qwen_tts import Qwen3TTSModel
+            # Handle list-based modules (code_predictor embeddings and lm_heads)
+            # talker.code_predictor.model.codec_embedding.0.weight -> talker.code_predictor.codec_embedding.0.weight
+            new_key = new_key.replace("code_predictor.model.", "code_predictor.")
 
-            model_path = self._model_path or "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
+            # talker.model.layers -> talker.layers
+            new_key = new_key.replace("talker.model.", "talker.")
 
-            # Determine device
-            if torch.cuda.is_available():
-                device = "cuda:0"
-                dtype = torch.bfloat16
-            elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-                device = "mps"
-                dtype = torch.float32  # MPS doesn't support bfloat16
-            else:
-                device = "cpu"
-                dtype = torch.float32
+            new_weights[new_key] = v
 
-            self._qwen_model = Qwen3TTSModel.from_pretrained(
-                model_path,
-                device_map=device,
-                dtype=dtype,
+        return new_weights
+
+    @property
+    def audio_tokenizer(self):
+        """Lazily load the audio tokenizer for decoding."""
+        if self._audio_tokenizer is None:
+            from mlx_audio.codec.models.qwen3_tokenizer import Qwen3TTSTokenizer
+
+            self._audio_tokenizer = Qwen3TTSTokenizer.from_pretrained(
+                "Qwen/Qwen3-TTS-Tokenizer-12Hz"
             )
+        return self._audio_tokenizer
 
-        except ImportError as e:
-            raise ImportError(
-                "Qwen3-TTS requires the qwen-tts package. "
-                "Install with: pip install qwen-tts torch"
-            ) from e
-        except Exception as e:
-            raise RuntimeError(
-                f"Failed to load Qwen3-TTS model: {e}. "
-                "Make sure you have internet access and the model is available."
-            ) from e
+    def get_speaker_token(self, speaker: str) -> int:
+        """Get speaker token ID."""
+        spk_lower = speaker.lower().replace(" ", "_")
+        return self.config.spk_id.get(spk_lower)
 
-    def get_language_id(self, language: str) -> int:
-        """Get the language token ID."""
+    def get_language_token(self, language: str) -> int:
+        """Get language token ID."""
         lang_lower = language.lower().replace(" ", "_")
         return self.config.codec_language_id.get(
             lang_lower, self.config.codec_language_id["english"]
         )
 
-    def get_speaker_id(self, speaker: str) -> int:
-        """Get the speaker token ID."""
-        spk_lower = speaker.lower().replace(" ", "_")
-        return self.config.spk_id.get(spk_lower)
+    def prepare_prompt(
+        self,
+        text: str,
+        speaker: Optional[str] = None,
+        instruct: Optional[str] = None,
+        language: str = "english",
+    ) -> tuple:
+        """Prepare input tokens for generation.
+
+        Returns:
+            input_ids: Token IDs
+            is_text: Boolean mask (True for text tokens, False for codec)
+        """
+        tokens = []
+        is_text_mask = []
+
+        # TTS BOS
+        tokens.append(self.config.tts_bos_token_id)
+        is_text_mask.append(True)
+
+        # Language token
+        lang_id = self.get_language_token(language)
+        tokens.append(lang_id)
+        is_text_mask.append(False)
+
+        # Speaker token (if CustomVoice)
+        if speaker:
+            spk_id = self.get_speaker_token(speaker)
+            if spk_id:
+                tokens.append(spk_id)
+                is_text_mask.append(False)
+
+        # Instruction (if provided)
+        if instruct:
+            instruct_ids = self.tokenizer.encode(instruct, add_special_tokens=False)
+            tokens.extend(instruct_ids)
+            is_text_mask.extend([True] * len(instruct_ids))
+
+        # Main text
+        text_ids = self.tokenizer.encode(text, add_special_tokens=False)
+        tokens.extend(text_ids)
+        is_text_mask.extend([True] * len(text_ids))
+
+        # Codec BOS
+        tokens.append(self.config.codec_bos_id)
+        is_text_mask.append(False)
+
+        input_ids = mx.array([tokens])
+        is_text = mx.array([is_text_mask])
+
+        return input_ids, is_text
 
     def generate_result(
         self,
@@ -124,7 +179,6 @@ class Model(nn.Module):
         start_time: float,
         token_count: int,
         segment_idx: int,
-        **kwargs,
     ) -> GenerationResult:
         """Create a GenerationResult from generated audio."""
         samples = audio.shape[-1] if audio is not None and audio.ndim > 0 else 0
@@ -133,7 +187,6 @@ class Model(nn.Module):
 
         sample_rate = self.sample_rate
         audio_duration_seconds = samples / sample_rate
-
         elapsed_time = time.perf_counter() - start_time
         rtf = audio_duration_seconds / elapsed_time if elapsed_time > 0 else 0
 
@@ -153,15 +206,11 @@ class Model(nn.Module):
             real_time_factor=rtf,
             prompt={
                 "tokens": token_count,
-                "tokens-per-sec": round(token_count / elapsed_time, 2)
-                if elapsed_time > 0
-                else 0,
+                "tokens-per-sec": round(token_count / elapsed_time, 2) if elapsed_time > 0 else 0,
             },
             audio_samples={
                 "samples": samples,
-                "samples-per-sec": round(samples / elapsed_time, 2)
-                if elapsed_time > 0
-                else 0,
+                "samples-per-sec": round(samples / elapsed_time, 2) if elapsed_time > 0 else 0,
             },
             processing_time_seconds=elapsed_time,
             peak_memory_usage=mx.get_peak_memory() / 1e9,
@@ -175,220 +224,164 @@ class Model(nn.Module):
         ref_text: Optional[str] = None,
         instruct: Optional[str] = None,
         language: str = "english",
-        temperature: float = 0.7,
+        temperature: float = 0.3,
         top_p: float = 0.9,
-        max_tokens: int = 4096,
+        max_tokens: int = 2000,
         split_pattern: str = "\n",
-        stream: bool = False,
-        streaming_interval: float = 2.0,
         verbose: bool = False,
         **kwargs,
     ) -> Generator[GenerationResult, None, None]:
-        """Generate speech from text.
-
-        This method supports three generation modes based on provided arguments:
-        1. Voice cloning: ref_audio + ref_text provided (requires Base model)
-        2. Custom voice: voice (speaker name) provided (requires CustomVoice model)
-        3. Voice design: instruct provided without voice (requires VoiceDesign model)
+        """Generate speech from text using native MLX.
 
         Args:
             text: Text to synthesize
-            voice: Speaker name for CustomVoice model (e.g., "vivian", "ryan")
-            ref_audio: Reference audio for voice cloning (as mx.array or numpy)
+            voice: Speaker name for CustomVoice model
+            ref_audio: Reference audio for voice cloning (Base model)
             ref_text: Transcript of reference audio
-            instruct: Instruction for emotion/style control or voice description
-            language: Target language (e.g., "english", "chinese")
+            instruct: Emotion/style instruction
+            language: Target language
             temperature: Sampling temperature
-            top_p: Top-p (nucleus) sampling parameter
-            max_tokens: Maximum tokens to generate
-            split_pattern: Pattern to split text into segments
-            stream: Whether to stream partial results (not fully supported yet)
-            streaming_interval: Interval (in seconds) between streaming updates
-            verbose: Whether to show progress
+            top_p: Top-p sampling
+            max_tokens: Maximum codec tokens to generate
+            split_pattern: Pattern to split text
+            verbose: Show progress
 
         Yields:
-            GenerationResult objects containing audio and metadata
+            GenerationResult with audio and metadata
         """
-        import numpy as np
-
-        self._load_qwen_model()
-
         # Split text into segments
         prompt_text = text.replace("\\n", "\n").replace("\\t", "\t")
         prompts = [p for p in prompt_text.split(split_pattern) if p.strip()]
-
-        # Capitalize language for qwen-tts API
-        lang_capitalized = language.capitalize()
 
         for segment_idx, segment_text in enumerate(prompts):
             time_start = time.perf_counter()
 
             if verbose:
-                print(
-                    f"Generating segment {segment_idx + 1}/{len(prompts)}: {segment_text[:50]}..."
+                print(f"Generating segment {segment_idx + 1}/{len(prompts)}: {segment_text[:50]}...")
+
+            # Prepare input
+            input_ids, is_text = self.prepare_prompt(
+                text=segment_text,
+                speaker=voice,
+                instruct=instruct,
+                language=language,
+            )
+
+            # Generate codes
+            codes = self._generate_codes(
+                input_ids=input_ids,
+                is_text=is_text,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+            )
+
+            if codes is not None and codes.shape[-1] > 0:
+                # Decode codes to audio
+                audio = self.audio_tokenizer.decode(codes)
+                audio = audio.squeeze()
+
+                token_count = codes.shape[-1] * codes.shape[1]
+
+                yield self.generate_result(
+                    audio=audio,
+                    start_time=time_start,
+                    token_count=token_count,
+                    segment_idx=segment_idx,
                 )
 
-            try:
-                # Determine generation mode and call appropriate method
-                if ref_audio is not None and ref_text is not None:
-                    # Voice cloning mode (Base model)
-                    audio_output, sr = self._generate_with_cloning(
-                        text=segment_text,
-                        ref_audio=ref_audio,
-                        ref_text=ref_text,
-                        language=lang_capitalized,
-                    )
-
-                elif voice is not None:
-                    # CustomVoice mode
-                    audio_output, sr = self._generate_with_speaker(
-                        text=segment_text,
-                        speaker=voice,
-                        instruct=instruct or "",
-                        language=lang_capitalized,
-                    )
-
-                elif instruct is not None:
-                    # VoiceDesign mode
-                    audio_output, sr = self._generate_with_design(
-                        text=segment_text,
-                        instruct=instruct,
-                        language=lang_capitalized,
-                    )
-
-                else:
-                    raise ValueError(
-                        "Must provide either: "
-                        "(1) ref_audio + ref_text for voice cloning, "
-                        "(2) voice for custom voice, or "
-                        "(3) instruct for voice design"
-                    )
-
-                # Convert output to MLX array
-                if audio_output is not None:
-                    if hasattr(audio_output, "cpu"):
-                        # PyTorch tensor
-                        audio_np = audio_output.cpu().numpy()
-                    elif isinstance(audio_output, list):
-                        # List of arrays (batch output)
-                        audio_np = np.array(audio_output[0])
-                    else:
-                        audio_np = np.array(audio_output)
-
-                    # Flatten if needed
-                    if audio_np.ndim > 1:
-                        audio_np = audio_np.flatten()
-
-                    audio_mx = mx.array(audio_np)
-
-                    # Calculate token count estimate
-                    token_count = int(
-                        audio_mx.shape[-1]
-                        / sr
-                        * self.frame_rate
-                        * self.config.num_code_groups
-                    )
-
-                    yield self.generate_result(
-                        audio=audio_mx,
-                        start_time=time_start,
-                        token_count=token_count,
-                        segment_idx=segment_idx,
-                    )
-
-            except Exception as e:
-                if verbose:
-                    print(f"Error generating segment {segment_idx}: {e}")
-                raise
-
-    def _generate_with_cloning(
+    def _generate_codes(
         self,
-        text: str,
-        ref_audio,
-        ref_text: str,
-        language: str,
-    ):
-        """Generate speech using voice cloning (requires Base model)."""
-        import numpy as np
+        input_ids: mx.array,
+        is_text: mx.array,
+        max_tokens: int,
+        temperature: float,
+        top_p: float,
+    ) -> mx.array:
+        """Generate codec tokens autoregressively."""
+        B = input_ids.shape[0]
+        cache = None
+        generated_first_codes = []
+        hidden_states_list = []
 
-        # Convert ref_audio to numpy if needed
-        if isinstance(ref_audio, mx.array):
-            ref_audio_np = np.array(ref_audio)
-        else:
-            ref_audio_np = np.array(ref_audio)
-
-        # Check if model supports voice cloning
-        if hasattr(self._qwen_model, "generate"):
-            # Base model with voice cloning
-            wavs, sr = self._qwen_model.generate(
-                text=text,
-                ref_audio=ref_audio_np,
-                ref_text=ref_text,
-                language=language,
-            )
-            return wavs, sr
-        else:
-            raise NotImplementedError(
-                "Voice cloning requires a Base model variant. "
-                "Try loading 'Qwen/Qwen3-TTS-12Hz-0.6B-Base' or '1.7B-Base'."
+        # Generate first codebook autoregressively
+        for step in range(max_tokens):
+            # Forward pass
+            logits, cache, hidden = self.talker(
+                input_ids, is_text, mask=None, cache=cache
             )
 
-    def _generate_with_speaker(
+            # Get logits for last position
+            next_logits = logits[:, -1, :]
+
+            # Sample next token
+            next_token = self._sample(next_logits, temperature, top_p)
+
+            generated_first_codes.append(next_token)
+            hidden_states_list.append(hidden[:, -1:, :])
+
+            # Check for EOS
+            if mx.all(next_token == self.config.codec_eos_token_id):
+                break
+
+            # Prepare next input (single token)
+            input_ids = next_token[:, None]
+            is_text = mx.zeros(input_ids.shape, dtype=mx.bool_)
+
+            # Evaluate periodically for memory efficiency
+            if step % 50 == 0:
+                mx.eval(cache)
+
+        if not generated_first_codes:
+            return None
+
+        # Stack generated codes
+        first_codes = mx.stack(generated_first_codes, axis=1)  # (batch, seq_len)
+        hidden_states = mx.concatenate(hidden_states_list, axis=1)
+
+        # Generate remaining codebooks using code predictor
+        remaining_codes = self.talker.code_predictor(hidden_states, first_codes)
+
+        # Combine all codebooks: (batch, 16, seq_len)
+        all_codes = mx.concatenate([first_codes[:, None, :], remaining_codes], axis=1)
+
+        return all_codes
+
+    def _sample(
         self,
-        text: str,
-        speaker: str,
-        instruct: str,
-        language: str,
-    ):
-        """Generate speech using a preset speaker (CustomVoice model)."""
-        # Validate speaker
-        spk_title = speaker.title().replace("_", "_")  # Keep underscores
-        # Map common name formats
-        speaker_map = {
-            "vivian": "Vivian",
-            "serena": "Serena",
-            "uncle_fu": "Uncle_Fu",
-            "dylan": "Dylan",
-            "eric": "Eric",
-            "ryan": "Ryan",
-            "aiden": "Aiden",
-            "ono_anna": "Ono_Anna",
-            "sohee": "Sohee",
-        }
-        speaker_name = speaker_map.get(speaker.lower(), spk_title)
+        logits: mx.array,
+        temperature: float,
+        top_p: float,
+    ) -> mx.array:
+        """Sample from logits with temperature and top-p."""
+        if temperature <= 0:
+            return mx.argmax(logits, axis=-1)
 
-        # Check if model has custom voice generation
-        if hasattr(self._qwen_model, "generate_custom_voice"):
-            wavs, sr = self._qwen_model.generate_custom_voice(
-                text=text,
-                language=language,
-                speaker=speaker_name,
-                instruct=instruct,
-            )
-            return wavs, sr
-        else:
-            raise NotImplementedError(
-                "Custom voice generation requires a CustomVoice model variant. "
-                "Try loading 'Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice' or '1.7B-CustomVoice'."
-            )
+        # Apply temperature
+        logits = logits / temperature
 
-    def _generate_with_design(
-        self,
-        text: str,
-        instruct: str,
-        language: str,
-    ):
-        """Generate speech using voice design (VoiceDesign model)."""
-        # Check if model has voice design generation
-        if hasattr(self._qwen_model, "generate_voice_design"):
-            wavs, sr = self._qwen_model.generate_voice_design(
-                text=text,
-                language=language,
-                instruct=instruct,
-            )
-            return wavs, sr
+        # Top-p (nucleus) sampling
+        if top_p < 1.0:
+            sorted_indices = mx.argsort(logits, axis=-1)[:, ::-1]
+            sorted_logits = mx.take_along_axis(logits, sorted_indices, axis=-1)
+            cumulative_probs = mx.cumsum(mx.softmax(sorted_logits, axis=-1), axis=-1)
+
+            # Remove tokens with cumulative prob > top_p
+            sorted_mask = cumulative_probs > top_p
+            # Keep at least one token
+            sorted_mask = mx.concatenate([
+                mx.zeros((logits.shape[0], 1), dtype=mx.bool_),
+                sorted_mask[:, :-1]
+            ], axis=-1)
+
+            sorted_logits = mx.where(sorted_mask, -float('inf'), sorted_logits)
+
+            # Sample from filtered distribution
+            probs = mx.softmax(sorted_logits, axis=-1)
+            sampled_idx = mx.random.categorical(mx.log(probs + 1e-10))
+            token = mx.take_along_axis(sorted_indices, sampled_idx[:, None], axis=-1)[:, 0]
         else:
-            raise NotImplementedError(
-                "Voice design generation requires a VoiceDesign model variant. "
-                "Try loading 'Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign'."
-            )
+            probs = mx.softmax(logits, axis=-1)
+            token = mx.random.categorical(mx.log(probs + 1e-10))
+
+        return token

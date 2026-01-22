@@ -46,9 +46,7 @@ class Conv1d(nn.Module):
             self.bias = None
 
     def __call__(self, x: mx.array) -> mx.array:
-        # x: (batch, channels, time) -> (batch, time, channels) for MLX conv
-        x = x.swapaxes(-1, -2)
-
+        # x: (batch, time, channels) - channel-last format (native MLX format)
         if self.padding > 0:
             x = mx.pad(x, [(0, 0), (self.padding, self.padding), (0, 0)])
 
@@ -64,8 +62,7 @@ class Conv1d(nn.Module):
         if self.bias is not None:
             y = y + self.bias
 
-        # Back to (batch, channels, time)
-        return y.swapaxes(-1, -2)
+        return y  # (batch, time, channels) - channel-last
 
 
 class ConvTranspose1d(nn.Module):
@@ -102,9 +99,7 @@ class ConvTranspose1d(nn.Module):
             self.bias = None
 
     def __call__(self, x: mx.array) -> mx.array:
-        # x: (batch, channels, time) -> (batch, time, channels) for MLX conv
-        x = x.swapaxes(-1, -2)
-
+        # x: (batch, time, channels) - channel-last format (native MLX format)
         y = mx.conv_transpose1d(
             x,
             self.weight,
@@ -116,7 +111,7 @@ class ConvTranspose1d(nn.Module):
         if self.bias is not None:
             y = y + self.bias
 
-        return y.swapaxes(-1, -2)
+        return y  # (batch, time, channels) - channel-last
 
 
 class CausalConv1d(nn.Module):
@@ -189,10 +184,9 @@ class Snake(nn.Module):
         self.beta = mx.ones((channels,))
 
     def __call__(self, x: mx.array) -> mx.array:
-        # x: (batch, channels, time)
-        alpha = self.alpha[None, :, None]
-        beta = self.beta[None, :, None]
-        return x + (1.0 / (beta + 1e-9)) * mx.power(mx.sin(alpha * x), 2)
+        # x: (batch, time, channels) - channel-last format
+        # alpha/beta shape (channels,) broadcasts with last dim
+        return x + (1.0 / (self.beta + 1e-9)) * mx.power(mx.sin(self.alpha * x), 2)
 
 
 class LayerScale(nn.Module):

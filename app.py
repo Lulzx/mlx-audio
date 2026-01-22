@@ -42,6 +42,15 @@ with st.sidebar:
         placeholder="e.g., happy and energetic, calm and soothing",
     )
 
+    temperature = st.slider(
+        "Temperature",
+        min_value=0.0,
+        max_value=1.0,
+        value=0.3,
+        step=0.1,
+        help="Lower = more deterministic, Higher = more varied",
+    )
+
     st.markdown("---")
     st.markdown("**Speaker Info:**")
     speaker_info = {
@@ -80,6 +89,7 @@ if generate_btn and text.strip():
                 voice=speaker.lower(),
                 language=language,
                 instruct=instruct if instruct else None,
+                temperature=temperature,
             ):
                 audio = np.array(result.audio)
                 sample_rate = result.sample_rate
