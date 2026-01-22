@@ -267,11 +267,18 @@ class Model(nn.Module):
                 language=language,
             )
 
+            # Calculate reasonable max_tokens based on text length
+            # ~2.5 words/sec speaking rate, 12.5 Hz frame rate = ~5 frames/word
+            # Use 15 frames/word as upper bound with minimum of 50 frames
+            word_count = len(segment_text.split())
+            text_based_max = max(50, word_count * 15)
+            effective_max = min(max_tokens, text_based_max)
+
             # Generate codes
             codes = self._generate_codes(
                 input_ids=input_ids,
                 is_text=is_text,
-                max_tokens=max_tokens,
+                max_tokens=effective_max,
                 temperature=temperature,
                 top_p=top_p,
             )
@@ -304,6 +311,10 @@ class Model(nn.Module):
         generated_first_codes = []
         hidden_states_list = []
 
+        # Valid audio codes are [0, 2047]. Tokens >= 2048 are special tokens.
+        # EOS token (2150) signals end of generation
+        eos_token = self.config.codec_eos_token_id
+
         # Generate first codebook autoregressively
         for step in range(max_tokens):
             # Forward pass
@@ -314,15 +325,26 @@ class Model(nn.Module):
             # Get logits for last position
             next_logits = logits[:, -1, :]
 
-            # Sample next token
+            # Mask out special tokens (>= 2048) to only allow valid audio codes
+            # This prevents the model from outputting BOS/EOS as audio codes
+            next_logits = mx.where(
+                mx.arange(next_logits.shape[-1]) >= 2048,
+                mx.array(-float('inf')),
+                next_logits
+            )
+
+            # Sample next token (now guaranteed to be in [0, 2047])
             next_token = self._sample(next_logits, temperature, top_p)
+
+            # Check for EOS by looking at unmasked logits
+            raw_logits = logits[:, -1, :]
+            eos_prob = mx.softmax(raw_logits, axis=-1)[:, eos_token]
+            min_frames = 10  # At least ~0.8 seconds of audio
+            if step >= min_frames and float(eos_prob[0]) > 0.5:
+                break
 
             generated_first_codes.append(next_token)
             hidden_states_list.append(hidden[:, -1:, :])
-
-            # Check for EOS
-            if mx.all(next_token == self.config.codec_eos_token_id):
-                break
 
             # Prepare next input (single token)
             input_ids = next_token[:, None]

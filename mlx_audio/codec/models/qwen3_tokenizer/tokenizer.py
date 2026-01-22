@@ -169,7 +169,7 @@ class Qwen3TTSTokenizer(nn.Module):
                         new_key = f"upsample.{idx}.convnext.{rest}"
 
             # Map SEANet decoder block names
-            # decoder.X.block.0.alpha -> decoder.decoder.X.block.norm.alpha
+            # decoder.X.block.0.alpha -> decoder.decoder.X.block.snake.alpha (SnakeBeta)
             # decoder.X.block.1.conv -> decoder.decoder.X.block.upsample.conv
             # decoder.X.block.{2,3,4}.* -> decoder.decoder.X.block.residuals.{0,1,2}.*
             if new_key.startswith("decoder.") and ".block." in new_key:
@@ -178,8 +178,8 @@ class Qwen3TTSTokenizer(nn.Module):
                     block_idx, sub_idx, rest = match.groups()
                     sub_idx = int(sub_idx)
                     if sub_idx == 0:
-                        # LayerNorm (alpha/beta)
-                        new_key = f"decoder.decoder.{block_idx}.block.norm.{rest}"
+                        # SnakeBeta activation (alpha/beta)
+                        new_key = f"decoder.decoder.{block_idx}.block.snake.{rest}"
                     elif sub_idx == 1:
                         # Upsample conv
                         new_key = f"decoder.decoder.{block_idx}.block.upsample.{rest}"

@@ -176,17 +176,23 @@ class CausalConv1d(nn.Module):
 
 
 class Snake(nn.Module):
-    """Snake activation function: x + (1/a) * sin^2(a * x)."""
+    """SnakeBeta activation: x + (1/exp(beta)) * sin^2(exp(alpha) * x).
+
+    Both alpha and beta are stored as log values, so we apply exp() to get
+    the actual frequency and magnitude parameters.
+    """
 
     def __init__(self, channels: int):
         super().__init__()
-        self.alpha = mx.ones((channels,))
-        self.beta = mx.ones((channels,))
+        self.alpha = mx.zeros((channels,))
+        self.beta = mx.zeros((channels,))
 
     def __call__(self, x: mx.array) -> mx.array:
         # x: (batch, time, channels) - channel-last format
-        # alpha/beta shape (channels,) broadcasts with last dim
-        return x + (1.0 / (self.beta + 1e-9)) * mx.power(mx.sin(self.alpha * x), 2)
+        # alpha/beta are log values, need exp()
+        alpha = mx.exp(self.alpha)
+        beta = mx.exp(self.beta)
+        return x + (1.0 / (beta + 1e-9)) * mx.power(mx.sin(alpha * x), 2)
 
 
 class LayerScale(nn.Module):

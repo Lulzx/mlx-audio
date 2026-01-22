@@ -497,18 +497,22 @@ class ConvDecoder(nn.Module):
 
 
 class SEANetResidualBlock(nn.Module):
-    """SEANet residual block with Snake activation.
+    """SEANet residual block with Snake activation and causal convolution.
 
     Matches weights: decoder.decoder.{1-4}.block.{2,3,4}.*
+
+    Uses causal (left-only) padding with optional dilation.
     """
 
-    def __init__(self, channels: int, kernel_size: int = 7):
+    def __init__(self, channels: int, kernel_size: int = 7, dilation: int = 1):
         super().__init__()
         self.act1 = Snake(channels)
         self.act2 = Snake(channels)
         # Note: conv1 and conv2 have nested .conv
-        self.conv1 = WNConv1d(channels, channels, kernel_size, padding=kernel_size // 2)
-        self.conv2 = WNConv1d(channels, channels, 1)
+        # Conv1 uses causal padding with dilation
+        self.conv1 = CausalDilatedConv1d(channels, channels, kernel_size, dilation=dilation)
+        # Conv2 is kernel_size=1, so no padding needed
+        self.conv2 = CausalConv1d(channels, channels, 1)
 
     def __call__(self, x: mx.array) -> mx.array:
         residual = x
@@ -517,6 +521,43 @@ class SEANetResidualBlock(nn.Module):
         x = self.act2(x)
         x = self.conv2(x)
         return x + residual
+
+
+class CausalDilatedConv1d(nn.Module):
+    """Causal dilated Conv1d.
+
+    Matches PyTorch CausalConvNet with dilation.
+    Effective kernel = (kernel_size - 1) * dilation + 1
+    Causal padding = effective_kernel - stride
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int,
+        stride: int = 1,
+        dilation: int = 1,
+    ):
+        super().__init__()
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.dilation = dilation
+        # Effective kernel size with dilation
+        self.effective_kernel = (kernel_size - 1) * dilation + 1
+        # Causal padding: left only
+        self.causal_padding = self.effective_kernel - stride
+        # Conv with dilation but no padding - we apply causal padding manually
+        self.conv = Conv1d(
+            in_channels, out_channels, kernel_size,
+            stride=stride, padding=0, dilation=dilation
+        )
+
+    def __call__(self, x: mx.array) -> mx.array:
+        # x: (batch, time, channels) - channel-last format
+        if self.causal_padding > 0:
+            x = mx.pad(x, [(0, 0), (self.causal_padding, 0), (0, 0)])
+        return self.conv(x)
 
 
 class WNConv1d(nn.Module):
@@ -534,6 +575,34 @@ class WNConv1d(nn.Module):
         self.conv = Conv1d(in_channels, out_channels, kernel_size, stride=stride, padding=padding)
 
     def __call__(self, x: mx.array) -> mx.array:
+        return self.conv(x)
+
+
+class CausalConv1d(nn.Module):
+    """Causal Conv1d with left-only padding (stored with nested .conv).
+
+    Matches PyTorch CausalConvNet: padding = kernel_size - stride (left only).
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int,
+        stride: int = 1,
+    ):
+        super().__init__()
+        self.kernel_size = kernel_size
+        self.stride = stride
+        # Causal padding: left only, no right padding
+        self.causal_padding = kernel_size - stride
+        # Conv with no padding - we'll apply causal padding manually
+        self.conv = Conv1d(in_channels, out_channels, kernel_size, stride=stride, padding=0)
+
+    def __call__(self, x: mx.array) -> mx.array:
+        # x: (batch, time, channels) - channel-last format
+        if self.causal_padding > 0:
+            x = mx.pad(x, [(0, 0), (self.causal_padding, 0), (0, 0)])
         return self.conv(x)
 
 
@@ -557,25 +626,49 @@ class SEANetBlock(nn.Module):
 
 
 class SEANetBlockInner(nn.Module):
-    """Inner block structure matching weight indices."""
+    """Inner block structure matching weight indices.
+
+    Structure (block.X):
+    - 0: SnakeBeta activation (alpha, beta)
+    - 1: ConvTranspose (in_ch -> out_ch)
+    - 2, 3, 4: ResidualBlocks with dilations 1, 3, 9
+    """
 
     def __init__(self, in_channels: int, out_channels: int, stride: int):
         super().__init__()
         # Match weight indices exactly
-        self.norm = LayerNormAB(in_channels)  # block.0.alpha/beta
+        # block.0: SnakeBeta activation (NOT LayerNorm!)
+        self.snake = BlockSnake(in_channels)
+        # block.1: Transposed convolution for upsampling
         self.upsample = WNConv1dTranspose(
             in_channels, out_channels, kernel_size=stride * 2, stride=stride
-        )  # block.1.conv
+        )
+        # block.2, 3, 4: Residual blocks with dilations 1, 3, 9
         self.residuals = [
-            SEANetResidualBlock(out_channels, kernel_size=7) for _ in range(3)
-        ]  # block.2, 3, 4
+            SEANetResidualBlock(out_channels, kernel_size=7, dilation=d)
+            for d in [1, 3, 9]
+        ]
 
     def __call__(self, x: mx.array) -> mx.array:
-        x = self.norm(x)
+        x = self.snake(x)
         x = self.upsample(x)
         for res in self.residuals:
             x = res(x)
         return x
+
+
+class BlockSnake(nn.Module):
+    """SnakeBeta activation matching block.0.alpha/beta weights."""
+
+    def __init__(self, channels: int):
+        super().__init__()
+        self.alpha = mx.zeros((channels,))
+        self.beta = mx.zeros((channels,))
+
+    def __call__(self, x: mx.array) -> mx.array:
+        alpha = mx.exp(self.alpha)
+        beta = mx.exp(self.beta)
+        return x + (1.0 / (beta + 1e-9)) * mx.power(mx.sin(alpha * x), 2)
 
 
 class LayerNormAB(nn.Module):
@@ -612,13 +705,34 @@ class WNConv1dTranspose(nn.Module):
         return self.conv(x)
 
 
+class FinalSnake(nn.Module):
+    """SnakeBeta activation for final layer.
+
+    Matches weights: decoder.decoder.5.alpha/beta
+
+    SnakeBeta: x + (1/exp(beta)) * sin^2(exp(alpha) * x)
+    Note: alpha and beta are stored as log values, so we apply exp().
+    """
+
+    def __init__(self, channels: int):
+        super().__init__()
+        self.alpha = mx.zeros((channels,))
+        self.beta = mx.zeros((channels,))
+
+    def __call__(self, x: mx.array) -> mx.array:
+        # x: (batch, time, channels) - channel-last format
+        alpha = mx.exp(self.alpha)
+        beta = mx.exp(self.beta)
+        return x + (1.0 / (beta + 1e-9)) * mx.power(mx.sin(alpha * x), 2)
+
+
 class SEANetDecoder(nn.Module):
     """SEANet decoder matching HuggingFace weight structure.
 
     Structure (decoder.decoder.X):
     - 0: Initial Conv1d (latent_dim -> decoder_dim, k=7)
     - 1-4: 4 upsample blocks with rates [8, 5, 4, 3]
-    - 5: Final LayerNorm (alpha, beta)
+    - 5: Final SnakeBeta activation (alpha, beta)
     - 6: Final Conv1d (96 -> 1, k=7)
 
     Total upsampling: 8*5*4*3 = 480x
@@ -641,8 +755,8 @@ class SEANetDecoder(nn.Module):
             self.decoder.append(SEANetBlock(channels, out_channels, rate))
             channels = out_channels
 
-        # Index 5: Final layer norm
-        self.decoder.append(LayerNormAB(channels))
+        # Index 5: Final SnakeBeta activation (NOT LayerNorm!)
+        self.decoder.append(FinalSnake(channels))
 
         # Index 6: Final conv to audio
         self.decoder.append(FinalConv(channels, 1))
@@ -662,24 +776,30 @@ class SEANetDecoder(nn.Module):
 
 
 class InitConv(nn.Module):
-    """Initial conv layer (decoder.decoder.0)."""
+    """Initial conv layer (decoder.decoder.0) with causal padding."""
 
     def __init__(self, in_channels: int, out_channels: int):
         super().__init__()
-        self.conv = Conv1d(in_channels, out_channels, kernel_size=7, padding=3)
+        # Causal padding for k=7: padding = 7 - 1 = 6 (left only)
+        self.causal_padding = 6
+        self.conv = Conv1d(in_channels, out_channels, kernel_size=7, padding=0)
 
     def __call__(self, x: mx.array) -> mx.array:
+        x = mx.pad(x, [(0, 0), (self.causal_padding, 0), (0, 0)])
         return self.conv(x)
 
 
 class FinalConv(nn.Module):
-    """Final conv layer (decoder.decoder.6)."""
+    """Final conv layer (decoder.decoder.6) with causal padding."""
 
     def __init__(self, in_channels: int, out_channels: int):
         super().__init__()
-        self.conv = Conv1d(in_channels, out_channels, kernel_size=7, padding=3)
+        # Causal padding for k=7: padding = 7 - 1 = 6 (left only)
+        self.causal_padding = 6
+        self.conv = Conv1d(in_channels, out_channels, kernel_size=7, padding=0)
 
     def __call__(self, x: mx.array) -> mx.array:
+        x = mx.pad(x, [(0, 0), (self.causal_padding, 0), (0, 0)])
         return self.conv(x)
 
 
@@ -763,9 +883,9 @@ class Decoder(nn.Module):
         # Quantizer dequantization
         self.quantizer = Quantizer(config)
 
-        # Pre-conv: (hidden_size -> latent_dim)
-        self.pre_conv = WNConv1d(
-            config.hidden_size, config.latent_dim, kernel_size=3, padding=1
+        # Pre-conv: (hidden_size -> latent_dim) with CAUSAL padding
+        self.pre_conv = CausalConv1d(
+            config.hidden_size, config.latent_dim, kernel_size=3, stride=1
         )
 
         # Pre-transformer
@@ -804,6 +924,9 @@ class Decoder(nn.Module):
 
         # SEANet decode to audio (480x)
         x = self.decoder(x)  # (batch, time, 1)
+
+        # Clamp to valid audio range (matching PyTorch)
+        x = mx.clip(x, -1.0, 1.0)
 
         return x.squeeze(-1)  # (batch, time)
 
