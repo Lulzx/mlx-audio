@@ -26,6 +26,8 @@ MODEL_REMAPPING = {
     "vibevoice_streaming": "vibevoice",
     "chatterbox_turbo": "chatterbox_turbo",
     "soprano": "soprano",
+    "qwen3_tts_talker": "qwen3_tts",
+    "qwen3_tts": "qwen3_tts",
 }
 MAX_FILE_SIZE_GB = 5
 MODEL_CONVERSION_DTYPES = ["float16", "bfloat16", "float32"]
